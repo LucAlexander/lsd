@@ -36,6 +36,10 @@ pub fn main() void {
 	};
 	defer mem.free(contents);
 	const tokens = tokenize(&mem, contents);
+	for (tokens.items) |token| {
+		std.debug.print("{s} ", .{token.text});
+	}
+	std.debug.print("\n", .{});
 	const graph = parse_file(&mem, tokens.items);
 	show_graph(graph);
 }
@@ -167,7 +171,7 @@ const Error = error {
 
 pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) std.StringHashMap(Buffer(Judgement)){
 	var i: u64 = 0;
-	const rules = std.StringHashMap(Buffer(Judgement)).init(mem.*);
+	var rules = std.StringHashMap(Buffer(Judgement)).init(mem.*);
 	while (i < tokens.len){
 		const token = tokens[i];
 		if (token.tag == .IDENTIFIER){
@@ -183,22 +187,79 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) std.StringHash
 			};
 			switch (judgement){
 				.bind => {
-					//TODO rules.put(judgement.bind.left_name.text, judgement)
-						//catch unreachable;
+					for (judgement.bind.left.items)|alt| {
+						var lone_alt_judgement = Judgement {
+							.bind = .{
+								.right = judgement.bind.right,
+								.body = judgement.bind.body,
+								.left = Buffer(Alt).init(mem.*)
+							}
+						};
+						lone_alt_judgement.bind.left.append(alt)
+							catch unreachable;
+						if (rules.get(alt.name.text)) |_| {
+							var buffer = rules.get(alt.name.text).?;
+							buffer.append(lone_alt_judgement)
+								catch unreachable;
+							continue;
+						}
+						var buffer = Buffer(Judgement).init(mem.*);
+						buffer.append(lone_alt_judgement)
+							catch unreachable;
+						rules.put(alt.name.text, buffer)
+							catch unreachable;
+					}
+					continue;
 					//TODO semantic checks
 				},
 				.unbind => {
-					// if (rules.get(judgement.unbind.name)) |_| {
-						// rules.remove(judgement.unbind.name)
-							// catch unreachable;
-						// //TODO is it possible to remove remove based on more specific descriminant criteria?
-					// }
+					outer: for (judgement.unbind.items) |alt| {
+						if (rules.get(alt.name.text)) |_| {
+							var buffer = rules.get(alt.name.text).?;
+							for (buffer.items, 0..) |overload, k| {
+								if (overload == .bind){
+									for (overload.bind.left.items)|overload_alt|{
+										if (arg_types_match(alt, overload_alt)){
+											_ = buffer.swapRemove(k);
+											continue :outer;
+										}
+									}
+								}
+							}
+							_ = rules.remove(alt.name.text);
+						}
+					}
 				}
 			}
 		}
 		i += 1;
 	}
 	return rules;
+}
+
+pub fn arg_types_match(a: Alt, b: Alt) bool {
+	if (a.args.items.len != b.args.items.len){
+		return false;
+	}
+	for (a.args.items, b.args.items) |real, candidate| {
+		if (real.* == .bind and candidate.* == .bind){
+			if (real.bind.right) |real_right| {
+				if (candidate.bind.right) |candidate_right| {
+					if (real_right.items.len == candidate_right.items.len){
+						for (real_right.items, candidate_right.items) |rri, cri| {
+							if (std.mem.eql(u8, rri.name.text, cri.name.text)){
+								continue;
+							}
+							return false;
+						}
+						continue;
+					}
+				}
+			}
+		}
+		return false;
+	}
+	return true; 
 }
 
 pub fn parse_judgement(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: TOKEN) Error!Judgement {
@@ -217,6 +278,7 @@ pub fn parse_judgement(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, 
 	};
 	while (true){
 		if (tokens[i.*].tag == end){
+			i.* += 1;
 			return rule;
 		}
 		const pause = i.*;
@@ -248,6 +310,7 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 		};
 		i.* += 1;
 		while (tokens[i.*].tag == .OPEN){
+			i.* += 1;
 			const rule = try parse_judgement(mem, tokens, i, .CLOSE);
 			const loc = mem.create(Judgement)
 				catch unreachable;
@@ -256,11 +319,13 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 				catch unreachable;
 		}
 		if (tokens[i.*].tag == end){
+			i.* += 1;
 			side.append(alt)
 				catch unreachable;
 			return side;
 		}
 		if (tokens[i.*].tag == .PIPE){
+			i.* += 1;
 			side.append(alt)
 				catch unreachable;
 			continue;
