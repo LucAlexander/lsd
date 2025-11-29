@@ -264,26 +264,76 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 		const term = right.items[0];
 		var new_application = AppliedJudgement{
 			.name=term.name,
+			.left=rule.bind.left,
 			.value=application.value,
 			.args = Buffer(*AppliedJudgement).init(mem.*)
 		};
 		for (term.args.items) |arg| {
 			for (application.args.items) |candidate| {
-				if (std.mem.eql(u8, , candidate.name.text)){ // TODO get arg name
-					if (prove_constraint(rules, , ) == false){ // TODO find sides from candidate and arg
-						//TODO this is a legit error case
+				if (arg.bind.right) |hasname| {
+					if (hasname.items.len != 0){
+						//TODO error case
 						return;
 					}
-					const loc = mem.create(AppliedJudgement)
-						catch unreachable;
-					loc.* = candidate;
-					new_application.args.append(loc)
-						catch unreachable;
+					const argname = hasname.items[0].name;
+					if (std.mem.eql(u8, argname.text, candidate.name.text)){
+						if (prove_constraint(rules, arg.bind.left, candidate.left) == false){
+							//TODO this is a legit error case
+							return;
+						}
+						new_application.args.append(candidate)
+							catch unreachable;
+					}
 				}
 			}
 		}
-		invoke(mem, rules, new_application, , );//TODO new judgement call, new generic map
+		if (rules.get(term.name.text)) |node| {
+			for (node.items) |edge| {
+				std.debug.assert(edge.bind.left.items.len == 1);
+				std.debug.assert(new_application.left.items.len == 1);
+				if (compare_args_for_invocation(mem, rules, new_application.left.items[0], edge.bind.left.items[0])) |new_generic_map| {
+					invoke(mem, rules, new_application, edge, new_generic_map);
+					return;
+				}
+			}
+		}
+		//TODO save for later invocation?
 	}
+}
+
+pub fn compare_args_for_invocation(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), left: Alt, right: Alt) ?std.StringHashMap(Token) {
+	var generic_map = std.StringHashMap(Token).init(mem.*);
+	if (left.args.items.len != right.args.items.len){
+		return null;
+	}
+	for (left.args.items, right.args.items) |arg, candidate| {
+		std.debug.assert(arg.* == .bind);
+		std.debug.assert(candidate.* == .bind);
+		const proves = prove_constraint(rules, arg.bind.left, candidate.bind.left);
+		for (arg.bind.left.items, candidate.bind.left.items) |arg_left, candidate_left| {
+			if (std.mem.eql(u8, arg_left.name.text, candidate_left.name.text) == false){
+				if (rules.get(candidate_left.name.text)) |_| {
+					generic_map.put(candidate_left.name.text, arg_left.name)
+						catch unreachable;
+					continue;
+				}
+				if (proves == false){
+					return null;
+				}
+				continue;
+			}
+			if (compare_args_for_invocation(mem, rules, arg_left, candidate_left)) |map| {
+				var it = map.iterator();
+				while (it.next()) |entry| {
+					generic_map.put(entry.key_ptr.*, entry.value_ptr.*)
+						catch unreachable;
+				}
+				continue;
+			}
+			return null;
+		}
+	}
+	return generic_map;
 }
 
 pub fn prove_constraint(rules: *std.StringHashMap(Buffer(Judgement)), left: Side, right: Side) bool {
@@ -297,7 +347,7 @@ pub fn prove_constraint(rules: *std.StringHashMap(Buffer(Judgement)), left: Side
 			for (node.items) |edge| {
 				std.debug.assert(edge == .bind);
 				if (edge.bind.right) |impl_right| {
-					if (compare_args_for_proof(lalt, edge)){
+					if (compare_args_for_proof(lalt, edge.bind.left.items[0])){
 						if (prove_constraint(rules, impl_right, right)) {
 							return true;
 						}
@@ -314,8 +364,8 @@ pub fn compare_args_for_proof(left: Alt, right: Alt) bool {
 		return false;
 	}
 	for (left.args.items, right.args.items) |arg, candidate| {
-		std.debug.assert(arg == .bind);
-		std.debug.assert(candidate == .bind);
+		std.debug.assert(arg.* == .bind);
+		std.debug.assert(candidate.* == .bind);
 		for (arg.bind.left.items, candidate.bind.left.items) |arg_left, candidate_left| {
 			if (std.mem.eql(u8, arg_left.name.text, candidate_left.name.text) == false){
 				return false;
@@ -530,6 +580,7 @@ pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffe
 
 const AppliedJudgement = struct {
 	name: Token,
+	left: Side,
 	value: []Token,
 	args: Buffer(*AppliedJudgement)
 };
@@ -550,6 +601,7 @@ pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: *std.StringHas
 			}
 			var applied = AppliedJudgement {
 				.name=arg.bind.right.?.items[0].name,
+				.left=arg.bind.left,
 				.value = tokens[i.*..i.*+1],
 				.args = Buffer(*AppliedJudgement).init(mem.*)
 			};
@@ -579,6 +631,7 @@ pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: *std.StringHas
 		if (std.mem.eql(u8, tokens[i.*].text, internal_alt.name.text)){
 			var applied = AppliedJudgement {
 				.name=arg.bind.right.?.items[0].name,
+				.left = arg.bind.left,
 				.value=undefined,
 				.args = Buffer(*AppliedJudgement).init(mem.*)
 			};
