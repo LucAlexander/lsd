@@ -178,63 +178,175 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) std.StringHash
 			const pause = i;
 			const judgement = parse_judgement(mem, tokens, &i, .SEMI) catch {
 				i = pause;
-				_ = parse_call(mem, rules, tokens, &i) catch {
+				parse_call(mem, &rules, tokens, &i) catch {
 					i = pause+1;
 					continue;
 				};
-				//TODO run call
 				continue;
 			};
 			switch (judgement){
 				.bind => {
-					for (judgement.bind.left.items)|alt| {
-						var lone_alt_judgement = Judgement {
-							.bind = .{
-								.right = judgement.bind.right,
-								.body = judgement.bind.body,
-								.left = Buffer(Alt).init(mem.*)
-							}
-						};
-						lone_alt_judgement.bind.left.append(alt)
-							catch unreachable;
-						if (rules.get(alt.name.text)) |_| {
-							var buffer = rules.get(alt.name.text).?;
-							buffer.append(lone_alt_judgement)
-								catch unreachable;
-							continue;
-						}
-						var buffer = Buffer(Judgement).init(mem.*);
-						buffer.append(lone_alt_judgement)
-							catch unreachable;
-						rules.put(alt.name.text, buffer)
-							catch unreachable;
-					}
+					add_judgement(mem, &rules, judgement);
 					continue;
-					//TODO semantic checks
 				},
 				.unbind => {
-					outer: for (judgement.unbind.items) |alt| {
-						if (rules.get(alt.name.text)) |_| {
-							var buffer = rules.get(alt.name.text).?;
-							for (buffer.items, 0..) |overload, k| {
-								if (overload == .bind){
-									for (overload.bind.left.items)|overload_alt|{
-										if (arg_types_match(alt, overload_alt)){
-											_ = buffer.swapRemove(k);
-											continue :outer;
-										}
-									}
-								}
-							}
-							_ = rules.remove(alt.name.text);
-						}
-					}
+					remove_judgement(&rules, judgement);
+					continue;
 				}
 			}
 		}
 		i += 1;
 	}
 	return rules;
+}
+
+pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), judgement: Judgement) void {
+	//TODO semantic checks
+	for (judgement.bind.left.items)|alt| {
+		var lone_alt_judgement = Judgement {
+			.bind = .{
+				.right = judgement.bind.right,
+				.body = judgement.bind.body,
+				.left = Buffer(Alt).init(mem.*)
+			}
+		};
+		lone_alt_judgement.bind.left.append(alt)
+			catch unreachable;
+		if (rules.get(alt.name.text)) |_| {
+			var buffer = rules.get(alt.name.text).?;
+			buffer.append(lone_alt_judgement)
+				catch unreachable;
+			continue;
+		}
+		var buffer = Buffer(Judgement).init(mem.*);
+		buffer.append(lone_alt_judgement)
+			catch unreachable;
+		rules.put(alt.name.text, buffer)
+			catch unreachable;
+	}
+}
+
+pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), judgement: Judgement) void {
+	outer: for (judgement.unbind.items) |alt| {
+		if (rules.get(alt.name.text)) |_| {
+			var buffer = rules.get(alt.name.text).?;
+			for (buffer.items, 0..) |overload, k| {
+				if (overload == .bind){
+					for (overload.bind.left.items)|overload_alt|{
+						if (arg_types_match(alt, overload_alt)){
+							_ = buffer.swapRemove(k);
+							continue :outer;
+						}
+					}
+				}
+			}
+			_ = rules.remove(alt.name.text);
+		}
+	}
+}
+
+pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), _: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) void {
+	for (rule.bind.body.items) |generation| {
+		const generated = apply_generics(mem, generation.*, generic_map);
+		switch (generated){
+			.bind => {
+				add_judgement(mem, rules, generated);
+			},
+			.unbind => {
+				remove_judgement(rules, generated);
+			}
+		}
+	}
+	//TODO invoke right side and follow through with reapplication
+}
+
+pub fn apply_generics(mem: *const std.mem.Allocator, template: Judgement, generic_map: std.StringHashMap(Token)) Judgement {
+	switch (template){
+		.bind => {
+			var generated = Judgement{
+				.bind=.{
+					.left = Buffer(Alt).init(mem.*),
+					.body = Buffer(*Judgement).init(mem.*),
+					.right = null
+				}
+			};
+			for (template.bind.left.items) |lalt| {
+				var new = Alt{
+					.name = lalt.name,
+					.args = Buffer(*Judgement).init(mem.*)
+				};
+				if (generic_map.get(new.name.text)) |replacement| {
+					new.name = replacement;
+				}
+				for (lalt.args.items) |target| {
+					const new_arg = apply_generics(mem, target.*, generic_map);
+					const loc = mem.create(Judgement)
+						catch unreachable;
+					loc.* = new_arg;
+					new.args.append(loc)
+						catch unreachable;
+				}
+				generated.bind.left.append(new)
+					catch unreachable;
+			}
+			for (template.bind.body.items) |subjudge| {
+				const new_judge = apply_generics(mem, subjudge.*, generic_map);
+				const loc = mem.create(Judgement)
+					catch unreachable;
+				loc.* = new_judge;
+				generated.bind.body.append(loc)
+					catch unreachable;
+			}
+			if (template.bind.right) |right| {
+				generated.bind.right = Buffer(Alt).init(mem.*);
+				for (right.items) |ralt| {
+					var new = Alt{
+						.name = ralt.name,
+						.args = Buffer(*Judgement).init(mem.*)
+					};
+					if (generic_map.get(new.name.text)) |replacement| {
+						new.name = replacement;
+					}
+					for (ralt.args.items) |target| {
+						const new_arg = apply_generics(mem, target.*, generic_map);
+						const loc = mem.create(Judgement)
+							catch unreachable;
+						loc.* = new_arg;
+						new.args.append(loc)
+							catch unreachable;
+					}
+					generated.bind.right.?.append(new)
+						catch unreachable;
+				}
+			}
+			return generated;
+		},
+		.unbind => {
+			var generated = Judgement{
+				.unbind=Buffer(Alt).init(mem.*)
+			};
+			for (template.unbind.items) |alt| {
+				var new = Alt{
+					.name=alt.name,
+					.args=Buffer(*Judgement).init(mem.*)
+				};
+				if (generic_map.get(new.name.text)) |replacement| {
+					new.name = replacement;
+				}
+				for (alt.args.items) |target| {
+					const new_arg = apply_generics(mem, target.*, generic_map);
+					const loc = mem.create(Judgement)
+						catch unreachable;
+					loc.* = new_arg;
+					new.args.append(loc)
+						catch unreachable;
+				}
+				generated.unbind.append(new)
+					catch unreachable;
+			}
+			return generated;
+		}
+	}
 }
 
 pub fn arg_types_match(a: Alt, b: Alt) bool {
@@ -336,20 +448,17 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 
 const Invocation = struct {
 	application: AppliedJudgement,
-	construction: Side
+	construction: Judgement
 };
 
-pub fn parse_call(mem: *const std.mem.Allocator, rules: std.StringHashMap(Buffer(Judgement)), tokens: []Token, i: *u64) Error!Invocation{
+pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), tokens: []Token, i: *u64) Error!void{
 	const pause = i.*;
 	if (rules.get(tokens[i.*].text)) |entry| {
 		for (entry.items) |rule| {
 			i.* = pause;
 			var generic_map = std.StringHashMap(Token).init(mem.*);
 			if (parse_judgement_call(mem, rules, rule, tokens, i, true, &generic_map)) |application| {
-				return Invocation{
-					.application=application,
-					.construction = rule.bind.right.?,
-				};
+				invoke(mem, rules, application, rule, generic_map);
 			}
 		}
 	}
@@ -362,7 +471,7 @@ const AppliedJudgement = struct {
 	args: Buffer(*AppliedJudgement)
 };
 
-pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: std.StringHashMap(Buffer(Judgement)), arg: Judgement, tokens: []Token, i: *u64, firsthand: bool, generic_map: *std.StringHashMap(Token)) ?AppliedJudgement {
+pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), arg: Judgement, tokens: []Token, i: *u64, firsthand: bool, generic_map: *std.StringHashMap(Token)) ?AppliedJudgement {
 	std.debug.assert(arg == .bind);
 	if (arg.bind.right) |right| {
 		std.debug.assert(right.items.len == 1);
