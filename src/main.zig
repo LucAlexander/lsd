@@ -245,7 +245,7 @@ pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), judgement:
 	}
 }
 
-pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), _: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) void {
+pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), application: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) void {
 	for (rule.bind.body.items) |generation| {
 		const generated = apply_generics(mem, generation.*, generic_map);
 		switch (generated){
@@ -257,7 +257,75 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 			}
 		}
 	}
-	//TODO invoke right side and follow through with reapplication
+	if (rule.bind.right) |right| {
+		if (right.items.len != 1){
+			return;
+		}
+		const term = right.items[0];
+		var new_application = AppliedJudgement{
+			.name=term.name,
+			.value=application.value,
+			.args = Buffer(*AppliedJudgement).init(mem.*)
+		};
+		for (term.args.items) |arg| {
+			for (application.args.items) |candidate| {
+				if (std.mem.eql(u8, , candidate.name.text)){ // TODO get arg name
+					if (prove_constraint(rules, , ) == false){ // TODO find sides from candidate and arg
+						//TODO this is a legit error case
+						return;
+					}
+					const loc = mem.create(AppliedJudgement)
+						catch unreachable;
+					loc.* = candidate;
+					new_application.args.append(loc)
+						catch unreachable;
+				}
+			}
+		}
+		invoke(mem, rules, new_application, , );//TODO new judgement call, new generic map
+	}
+}
+
+pub fn prove_constraint(rules: *std.StringHashMap(Buffer(Judgement)), left: Side, right: Side) bool {
+	for (left.items) |lalt| {
+		for (right.items) |ralt| {
+			if (std.mem.eql(u8, lalt.name.text, ralt.name.text)){
+				return true;
+			}
+		}
+		if (rules.get(lalt.name.text)) |node| {
+			for (node.items) |edge| {
+				std.debug.assert(edge == .bind);
+				if (edge.bind.right) |impl_right| {
+					if (compare_args_for_proof(lalt, edge)){
+						if (prove_constraint(rules, impl_right, right)) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+pub fn compare_args_for_proof(left: Alt, right: Alt) bool {
+	if (left.args.items.len > right.args.items.len){
+		return false;
+	}
+	for (left.args.items, right.args.items) |arg, candidate| {
+		std.debug.assert(arg == .bind);
+		std.debug.assert(candidate == .bind);
+		for (arg.bind.left.items, candidate.bind.left.items) |arg_left, candidate_left| {
+			if (std.mem.eql(u8, arg_left.name.text, candidate_left.name.text) == false){
+				return false;
+			}
+			if (compare_args_for_proof(arg_left, candidate_left) == false){
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 pub fn apply_generics(mem: *const std.mem.Allocator, template: Judgement, generic_map: std.StringHashMap(Token)) Judgement {
@@ -445,11 +513,6 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 	}
 	return Error.BrokenParse;
 }
-
-const Invocation = struct {
-	application: AppliedJudgement,
-	construction: Judgement
-};
 
 pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), tokens: []Token, i: *u64) Error!void{
 	const pause = i.*;
