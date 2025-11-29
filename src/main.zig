@@ -334,8 +334,100 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 	return Error.BrokenParse;
 }
 
-pub fn parse_call(_: *const std.mem.Allocator, _: std.StringHashMap(Buffer(Judgement)), _: []Token, _: *u64) Error!Judgement {
+const Invocation = struct {
+	application: AppliedJudgement,
+	construction: Side
+};
+
+pub fn parse_call(mem: *const std.mem.Allocator, rules: std.StringHashMap(Buffer(Judgement)), tokens: []Token, i: *u64) Error!Invocation{
+	const pause = i.*;
+	if (rules.get(tokens[i.*].text)) |entry| {
+		for (entry.items) |rule| {
+			i.* = pause;
+			var generic_map = std.StringHashMap(Token).init(mem.*);
+			if (parse_judgement_call(mem, rules, rule, tokens, i, true, &generic_map)) |application| {
+				return Invocation{
+					.application=application,
+					.construction = rule.bind.right.?,
+				};
+			}
+		}
+	}
 	return Error.BrokenParse;
+}
+
+const AppliedJudgement = struct {
+	name: Token,
+	value: []Token,
+	args: Buffer(*AppliedJudgement)
+};
+
+pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: std.StringHashMap(Buffer(Judgement)), arg: Judgement, tokens: []Token, i: *u64, firsthand: bool, generic_map: *std.StringHashMap(Token)) ?AppliedJudgement {
+	std.debug.assert(arg == .bind);
+	if (arg.bind.right) |right| {
+		std.debug.assert(right.items.len == 1);
+	}
+	outer: for (arg.bind.left.items) |internal_alt| {
+		if (firsthand == false){
+			if (rules.get(internal_alt.name.text)) |buffer| {
+				for (buffer.items) |entry| {
+					if (parse_judgement_call(mem, rules, entry, tokens, i, true, generic_map)) |success| {
+						return success;
+					}
+				}
+			}
+			var applied = AppliedJudgement {
+				.name=arg.bind.right.?.items[0].name,
+				.value = tokens[i.*..i.*+1],
+				.args = Buffer(*AppliedJudgement).init(mem.*)
+			};
+			if (generic_map.get(internal_alt.name.text)) |exists| {
+				if (std.mem.eql(u8, applied.value[0].text, exists.text) == false){
+					return null;
+				}
+			}
+			else{
+				generic_map.put(internal_alt.name.text, tokens[i.*])
+					catch unreachable;
+			}
+			i.* += 1;
+			for (internal_alt.args.items) |argument| {
+				if (parse_judgement_call(mem, rules, argument.*, tokens, i, false, generic_map)) |application| {
+					const loc = mem.create(AppliedJudgement)
+						catch unreachable;
+					loc.* = application;
+					applied.args.append(loc)
+						catch unreachable;
+					 continue;
+				}
+				continue :outer;
+			}
+			return applied;
+		}
+		if (std.mem.eql(u8, tokens[i.*].text, internal_alt.name.text)){
+			var applied = AppliedJudgement {
+				.name=arg.bind.right.?.items[0].name,
+				.value=undefined,
+				.args = Buffer(*AppliedJudgement).init(mem.*)
+			};
+			const start = i.*;
+			i.* += 1;
+			for (internal_alt.args.items) |argument| {
+				if (parse_judgement_call(mem, rules, argument.*, tokens, i, false, generic_map)) |application| {
+					const loc = mem.create(AppliedJudgement)
+						catch unreachable;
+					loc.* = application;
+					applied.args.append(loc)
+						catch unreachable;
+					 continue;
+				}
+				continue :outer;
+			}
+			applied.value = tokens[start .. i.*];
+			return applied;
+		}
+	}
+	return null;
 }
 
 pub fn show_graph(rules: std.StringHashMap(Buffer(Judgement))) void {
