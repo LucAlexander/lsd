@@ -41,7 +41,6 @@ pub fn main() void {
 	}
 	std.debug.print("\n", .{});
 	const graph = parse_file(&mem, tokens.items) catch {
-		//TODO print out sensible error
 		return;
 	};
 	show_graph(graph);
@@ -289,12 +288,18 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 		for (term.args.items) |arg| {
 			for (application.args.items) |candidate| {
 				if (arg.bind.right) |hasname| {
-					if (hasname.items.len != 0){
+					if (hasname.items.len != 1){
+						std.debug.print("Argument nondeterminable:\n", .{});
+						show_side(hasname);
 						return Error.ProofFailed;
 					}
 					const argname = hasname.items[0].name;
 					if (std.mem.eql(u8, argname.text, candidate.name.text)){
 						if (prove_constraint(rules, arg.bind.left, candidate.left) == false){
+							std.debug.print("Constraint not provable:\n", .{});
+							show_side(arg.bind.left);
+							std.debug.print("no path to:\n", .{});
+							show_side(candidate.left);
 							return Error.ProofFailed;
 						}
 						new_application.args.append(candidate)
