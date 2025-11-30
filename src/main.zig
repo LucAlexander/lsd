@@ -36,6 +36,7 @@ pub fn main() void {
 	};
 	defer mem.free(contents);
 	const tokens = tokenize(&mem, contents);
+	std.debug.print("Tokens: \n", .{});
 	for (tokens.items) |token| {
 		std.debug.print("{s} ", .{token.text});
 	}
@@ -43,6 +44,7 @@ pub fn main() void {
 	const graph = parse_file(&mem, tokens.items) catch {
 		return;
 	};
+	std.debug.print("Graph judgements:\n", .{});
 	show_graph(graph);
 }
 
@@ -175,6 +177,7 @@ const Error = error {
 pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) Error!std.StringHashMap(Buffer(Judgement)){
 	var i: u64 = 0;
 	var rules = std.StringHashMap(Buffer(Judgement)).init(mem.*);
+	var reverse = std.StringHashMap(Buffer(Judgement)).init(mem.*);
 	var lazy = std.StringHashMap(AppliedJudgement).init(mem.*);
 	while (i < tokens.len){
 		const token = tokens[i];
@@ -182,7 +185,7 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) Error!std.Stri
 			const pause = i;
 			const judgement = parse_judgement(mem, tokens, &i, .SEMI) catch {
 				i = pause;
-				parse_call(mem, &rules, &lazy, tokens, &i) catch |err| {
+				parse_call(mem, &rules, &reverse, &lazy, tokens, &i) catch |err| {
 					switch (err) {
 						Error.BrokenParse => {
 							i = pause+1;
@@ -198,11 +201,11 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) Error!std.Stri
 			};
 			switch (judgement){
 				.bind => {
-					try add_judgement(mem, &rules, &lazy, judgement);
+					try add_judgement(mem, &rules, &reverse, &lazy, judgement);
 					continue;
 				},
 				.unbind => {
-					remove_judgement(&rules, judgement);
+					remove_judgement(&rules, &reverse, judgement);
 					continue;
 				}
 			}
@@ -212,7 +215,7 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) Error!std.Stri
 	return rules;
 }
 
-pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), judgement: Judgement) Error!void {
+pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), reverse: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), judgement: Judgement) Error!void {
 	//TODO semantic checks
 	for (judgement.bind.left.items)|alt| {
 		var lone_alt_judgement = Judgement {
@@ -237,13 +240,39 @@ pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Bu
 			catch unreachable;
 		if (lazy.get(alt.name.text)) |new_application| {
 			if (compare_args_for_invocation(mem, rules, new_application.left.items[0], lone_alt_judgement.bind.left.items[0])) |generic_map| {
-				try invoke(mem, rules, lazy, new_application, lone_alt_judgement, generic_map);
+				try invoke(mem, rules, reverse, lazy, new_application, lone_alt_judgement, generic_map);
+			}
+		}
+	}
+	if (judgement.bind.right) |right| {
+		for (right.items) |ralt| {
+			for (judgement.bind.left.items)|alt| {
+				var lone_alt_judgement = Judgement {
+					.bind = .{
+						.right = judgement.bind.right,
+						.body = judgement.bind.body,
+						.left = Buffer(Alt).init(mem.*)
+					}
+				};
+				lone_alt_judgement.bind.left.append(alt)
+					catch unreachable;
+				if (reverse.get(alt.name.text)) |_| {
+					var buffer = reverse.get(alt.name.text).?;
+					buffer.append(lone_alt_judgement)
+						catch unreachable;
+					continue;
+				}
+				var buffer = Buffer(Judgement).init(mem.*);
+				buffer.append(lone_alt_judgement)
+					catch unreachable;
+				reverse.put(ralt.name.text, buffer)
+					catch unreachable;
 			}
 		}
 	}
 }
 
-pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), judgement: Judgement) void {
+pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), reverse: *std.StringHashMap(Buffer(Judgement)), judgement: Judgement) void {
 	outer: for (judgement.unbind.items) |alt| {
 		if (rules.get(alt.name.text)) |_| {
 			var buffer = rules.get(alt.name.text).?;
@@ -259,18 +288,23 @@ pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), judgement:
 			}
 			_ = rules.remove(alt.name.text);
 		}
+		if (reverse.get(alt.name.text)) |_| {
+			_ = reverse.remove(alt.name.text);
+		}
 	}
 }
 
-pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), application: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) Error!void {
+pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), reverse: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), application: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) Error!void {
+	std.debug.print("Invocation:\n", .{});
+	show_judgement(rule);
 	for (rule.bind.body.items) |generation| {
 		const generated = apply_generics(mem, generation.*, generic_map);
 		switch (generated){
 			.bind => {
-				try add_judgement(mem, rules, lazy, generated);
+				try add_judgement(mem, rules, reverse, lazy, generated);
 			},
 			.unbind => {
-				remove_judgement(rules, generated);
+				remove_judgement(rules, reverse, generated);
 			}
 		}
 	}
@@ -308,18 +342,21 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 				}
 			}
 		}
+		var found = false;
 		if (rules.get(term.name.text)) |node| {
 			for (node.items) |edge| {
 				std.debug.assert(edge.bind.left.items.len == 1);
 				std.debug.assert(new_application.left.items.len == 1);
 				if (compare_args_for_invocation(mem, rules, new_application.left.items[0], edge.bind.left.items[0])) |new_generic_map| {
-					try invoke(mem, rules, lazy, new_application, edge, new_generic_map);
-					return;
+					try invoke(mem, rules, reverse, lazy, new_application, edge, new_generic_map);
+					found = true;
 				}
 			}
 		}
-		lazy.put(term.name.text, new_application)
-			catch unreachable;
+		if (!found){
+			lazy.put(term.name.text, new_application)
+				catch unreachable;
+		}
 	}
 }
 
@@ -516,6 +553,9 @@ pub fn arg_types_match(a: Alt, b: Alt) bool {
 
 pub fn parse_judgement(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: TOKEN) Error!Judgement {
 	const left = try parse_side(mem, tokens, i, .TURN);
+	if (i.* >= tokens.len){
+		return Error.BrokenParse;
+	}
 	if (tokens[i.*].tag == .UNBIND){
 		return Judgement {
 			.unbind = left
@@ -561,6 +601,11 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 			.args=Buffer(*Judgement).init(mem.*)
 		};
 		i.* += 1;
+		if (i.* >= tokens.len){
+			side.append(alt)
+				catch unreachable;
+			return side;
+		}
 		while (tokens[i.*].tag == .OPEN){
 			i.* += 1;
 			const rule = try parse_judgement(mem, tokens, i, .CLOSE);
@@ -586,14 +631,14 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 	return Error.BrokenParse;
 }
 
-pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), tokens: []Token, i: *u64) Error!void{
+pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), reverse: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), tokens: []Token, i: *u64) Error!void{
 	const pause = i.*;
 	if (rules.get(tokens[i.*].text)) |entry| {
 		for (entry.items) |rule| {
 			i.* = pause;
 			var generic_map = std.StringHashMap(Token).init(mem.*);
 			if (parse_judgement_call(mem, rules, rule, tokens, i, true, &generic_map)) |application| {
-				try invoke(mem, rules, lazy, application, rule, generic_map);
+				try invoke(mem, rules, reverse, lazy, application, rule, generic_map);
 				return;
 			}
 		}
@@ -611,10 +656,13 @@ const AppliedJudgement = struct {
 pub fn parse_judgement_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), arg: Judgement, tokens: []Token, i: *u64, firsthand: bool, generic_map: *std.StringHashMap(Token)) ?AppliedJudgement {
 	std.debug.assert(arg == .bind);
 	if (arg.bind.right) |right| {
-		std.debug.assert(right.items.len == 1);
+		if (right.items.len != 1){
+			return null;
+		}
 	}
 	outer: for (arg.bind.left.items) |internal_alt| {
 		if (firsthand == false){
+			//TODO also look back to find if anything leads to this, or leads to something that leads to this, we need a memoized dfs, for that we need a reverse lookup rules map
 			if (rules.get(internal_alt.name.text)) |buffer| {
 				for (buffer.items) |entry| {
 					if (parse_judgement_call(mem, rules, entry, tokens, i, true, generic_map)) |success| {
