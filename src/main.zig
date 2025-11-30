@@ -40,7 +40,10 @@ pub fn main() void {
 		std.debug.print("{s} ", .{token.text});
 	}
 	std.debug.print("\n", .{});
-	const graph = parse_file(&mem, tokens.items);
+	const graph = parse_file(&mem, tokens.items) catch {
+		//TODO print out sensible error
+		return;
+	};
 	show_graph(graph);
 }
 
@@ -166,27 +169,37 @@ const Judgement = union(enum){
 };
 
 const Error = error {
-	BrokenParse
+	BrokenParse,
+	ProofFailed
 };
 
-pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) std.StringHashMap(Buffer(Judgement)){
+pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) Error!std.StringHashMap(Buffer(Judgement)){
 	var i: u64 = 0;
 	var rules = std.StringHashMap(Buffer(Judgement)).init(mem.*);
+	var lazy = std.StringHashMap(AppliedJudgement).init(mem.*);
 	while (i < tokens.len){
 		const token = tokens[i];
 		if (token.tag == .IDENTIFIER){
 			const pause = i;
 			const judgement = parse_judgement(mem, tokens, &i, .SEMI) catch {
 				i = pause;
-				parse_call(mem, &rules, tokens, &i) catch {
-					i = pause+1;
-					continue;
+				parse_call(mem, &rules, &lazy, tokens, &i) catch |err| {
+					switch (err) {
+						Error.BrokenParse => {
+							i = pause+1;
+							continue;
+						},
+						Error.ProofFailed => {
+							std.debug.print("Failed proof\n", .{});
+							return err;
+						}
+					}
 				};
 				continue;
 			};
 			switch (judgement){
 				.bind => {
-					add_judgement(mem, &rules, judgement);
+					try add_judgement(mem, &rules, &lazy, judgement);
 					continue;
 				},
 				.unbind => {
@@ -200,7 +213,7 @@ pub fn parse_file(mem: *const std.mem.Allocator, tokens: []Token) std.StringHash
 	return rules;
 }
 
-pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), judgement: Judgement) void {
+pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), judgement: Judgement) Error!void {
 	//TODO semantic checks
 	for (judgement.bind.left.items)|alt| {
 		var lone_alt_judgement = Judgement {
@@ -223,6 +236,11 @@ pub fn add_judgement(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Bu
 			catch unreachable;
 		rules.put(alt.name.text, buffer)
 			catch unreachable;
+		if (lazy.get(alt.name.text)) |new_application| {
+			if (compare_args_for_invocation(mem, rules, new_application.left.items[0], lone_alt_judgement.bind.left.items[0])) |generic_map| {
+				try invoke(mem, rules, lazy, new_application, lone_alt_judgement, generic_map);
+			}
+		}
 	}
 }
 
@@ -245,12 +263,12 @@ pub fn remove_judgement(rules: *std.StringHashMap(Buffer(Judgement)), judgement:
 	}
 }
 
-pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), application: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) void {
+pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), application: AppliedJudgement, rule: Judgement, generic_map: std.StringHashMap(Token)) Error!void {
 	for (rule.bind.body.items) |generation| {
 		const generated = apply_generics(mem, generation.*, generic_map);
 		switch (generated){
 			.bind => {
-				add_judgement(mem, rules, generated);
+				try add_judgement(mem, rules, lazy, generated);
 			},
 			.unbind => {
 				remove_judgement(rules, generated);
@@ -272,14 +290,12 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 			for (application.args.items) |candidate| {
 				if (arg.bind.right) |hasname| {
 					if (hasname.items.len != 0){
-						//TODO error case
-						return;
+						return Error.ProofFailed;
 					}
 					const argname = hasname.items[0].name;
 					if (std.mem.eql(u8, argname.text, candidate.name.text)){
 						if (prove_constraint(rules, arg.bind.left, candidate.left) == false){
-							//TODO this is a legit error case
-							return;
+							return Error.ProofFailed;
 						}
 						new_application.args.append(candidate)
 							catch unreachable;
@@ -292,12 +308,13 @@ pub fn invoke(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Ju
 				std.debug.assert(edge.bind.left.items.len == 1);
 				std.debug.assert(new_application.left.items.len == 1);
 				if (compare_args_for_invocation(mem, rules, new_application.left.items[0], edge.bind.left.items[0])) |new_generic_map| {
-					invoke(mem, rules, new_application, edge, new_generic_map);
+					try invoke(mem, rules, lazy, new_application, edge, new_generic_map);
 					return;
 				}
 			}
 		}
-		//TODO save for later invocation?
+		lazy.put(term.name.text, new_application)
+			catch unreachable;
 	}
 }
 
@@ -564,14 +581,15 @@ pub fn parse_side(mem: *const std.mem.Allocator, tokens: []Token, i: *u64, end: 
 	return Error.BrokenParse;
 }
 
-pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), tokens: []Token, i: *u64) Error!void{
+pub fn parse_call(mem: *const std.mem.Allocator, rules: *std.StringHashMap(Buffer(Judgement)), lazy: *std.StringHashMap(AppliedJudgement), tokens: []Token, i: *u64) Error!void{
 	const pause = i.*;
 	if (rules.get(tokens[i.*].text)) |entry| {
 		for (entry.items) |rule| {
 			i.* = pause;
 			var generic_map = std.StringHashMap(Token).init(mem.*);
 			if (parse_judgement_call(mem, rules, rule, tokens, i, true, &generic_map)) |application| {
-				invoke(mem, rules, application, rule, generic_map);
+				try invoke(mem, rules, lazy, application, rule, generic_map);
+				return;
 			}
 		}
 	}
